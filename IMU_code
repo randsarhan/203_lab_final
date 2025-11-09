@@ -1,0 +1,143 @@
+// Feather nRF52840 + Adafruit LSM6DS3TR-C (I2C)
+// Sends CSV over Serial1: yawRate_rad_s,temperature_C,speed_mps
+
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_LSM6DS3TRC.h>
+
+
+Adafruit_LSM6DS3TRC imu;
+
+
+// ====== Tunables ======
+constexpr float SAMPLE_HZ   = 104.0f;
+constexpr uint32_t LOOP_US  = uint32_t(1e6 / SAMPLE_HZ);
+
+
+// Choose which IMU axis is "forward":
+// +1 = +X, -1 = -X, +2 = +Y, -2 = -Y, +3 = +Z, -3 = -Z
+int FORWARD_AXIS = -1;
+
+
+// Simple speed estimator params
+constexpr float HP_ALPHA   = 0.995f;   // high-pass (bias removal)
+constexpr float LEAK_PER_S = 0.03f;    // ~3%/s leak to 0
+constexpr float SPEED_MIN  = 0.0f;
+constexpr float SPEED_MAX  = 10.0f;
+constexpr uint16_t BIAS_SAMPLES = 200; // ~2s still at startup
+
+
+// Optional smoothing for yaw rate (0=no smoothing; 0.0–1.0)
+constexpr float YAWRATE_LP_ALPHA = 0.10f;  // simple 1st-order LPF
+
+
+// ====== State ======
+uint32_t t_last = 0;
+float speed_mps = 0.0f;
+float acc_bias = 0.0f;
+float acc_hp_state = 0.0f;
+float yawRate_rad_s_filt = 0.0f;   // filtered yaw rate
+
+
+float forwardAxisAccel(const sensors_event_t &acc) {
+ switch (FORWARD_AXIS) {
+   case +1: return  acc.acceleration.x;
+   case -1: return -acc.acceleration.x;
+   case +2: return  acc.acceleration.y;
+   case -2: return -acc.acceleration.y;
+   case +3: return  acc.acceleration.z;
+   case -3: return -acc.acceleration.z;
+ }
+ return acc.acceleration.y; // default
+}
+
+
+
+
+void setup() {
+ Serial.begin(115200);      // USB debug (optional)
+ delay(200);
+ Serial1.begin(115200);     // Feather pin1=TX → XIAO RX, pin0=RX ← XIAO TX (optional)
+
+
+ Wire.begin();
+ Wire.setClock(400000);
+
+
+ if (!imu.begin_I2C()) {
+   Serial.println("ERROR: LSM6DS3TR-C not found. Check SDA/SCL wiring.");
+   while (1) delay(500);
+ }
+
+
+ imu.setAccelRange(LSM6DS_ACCEL_RANGE_4_G);
+ imu.setGyroRange(LSM6DS_GYRO_RANGE_500_DPS);
+ imu.setAccelDataRate(LSM6DS_RATE_104_HZ);
+ imu.setGyroDataRate(LSM6DS_RATE_104_HZ);
+
+
+ // Learn forward-axis accel bias while still
+ Serial.println("Keep still ~2s (bias learn)...");
+ double sum = 0.0;
+ for (uint16_t i = 0; i < BIAS_SAMPLES; ++i) {
+   sensors_event_t a,g,t;
+   imu.getEvent(&a,&g,&t);
+   sum += forwardAxisAccel(a);
+   delay(1000 / SAMPLE_HZ);
+ }
+ acc_bias = (float)(sum / BIAS_SAMPLES);
+ Serial.print("Bias = "); Serial.println(acc_bias, 4);
+
+
+ t_last = micros();
+ Serial.println("Streaming: yawRate_rad_s,temperature_C,speed_mps");
+}
+
+
+void loop() {
+ uint32_t now = micros();
+ if ((now - t_last) < LOOP_US) return;
+ float dt = (now - t_last) / 1e6f;
+ t_last += LOOP_US;
+
+
+ sensors_event_t acc, gyro, temp;
+ imu.getEvent(&acc, &gyro, &temp);
+
+
+ // --- Yaw rate directly from gyro Z (already in rad/s) ---
+ float yawRate_rad_s = gyro.gyro.z;
+
+
+ // Optional simple low-pass to reduce noise
+ yawRate_rad_s_filt = (1.0f - YAWRATE_LP_ALPHA) * yawRate_rad_s_filt
+                    + YAWRATE_LP_ALPHA * yawRate_rad_s;
+
+
+ // --- Speed: HP-filter forward accel, integrate with leak ---
+ static float x_prev = 0.0f;
+ float a_fwd = forwardAxisAccel(acc);      // m/s^2
+ float x = a_fwd - acc_bias;
+ acc_hp_state = HP_ALPHA * (acc_hp_state + x - x_prev);
+ x_prev = x;
+
+
+ speed_mps += acc_hp_state * dt;
+ float leak = 1.0f - LEAK_PER_S * dt;
+ if (leak < 0.0f) leak = 0.0f;
+ speed_mps *= leak;
+
+
+ if (speed_mps < SPEED_MIN) speed_mps = SPEED_MIN;
+ if (speed_mps > SPEED_MAX) speed_mps = SPEED_MAX;
+
+
+ // CSV out to XIAO: yawRate_rad_s, temperature_C, speed_mps
+ Serial1.printf("%.5f,%.2f,%.3f\n", yawRate_rad_s_filt, temp.temperature, speed_mps);
+
+
+ // (Optional) also echo to USB:
+ Serial.printf("%.5f,%.2f,%.3f\n", yawRate_rad_s_filt, temp.temperature, speed_mps);
+}

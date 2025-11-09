@@ -1,0 +1,217 @@
+// ===== LoRa Sender + ThingsBoard Bridge =====
+// - Send keyboard commands over LoRa (your original behavior)
+// - Receive telemetry JSON from LoRa receiver and forward to ThingsBoard
+//
+// Telemetry JSON expected from receiver:
+//   {"id":"node-02","telemetry":{"yawRate":<rad/s>,"tempC":<C>,"speed":<m/s>}}
+//
+// Publishes to TB as telemetry keys: yawRate, temperature, speed, rssi, snr
+
+
+#include <Arduino.h>
+#include <RadioLib.h>
+#include <ArduinoJson.h>
+
+
+#if defined(ESP8266)
+ #include <ESP8266WiFi.h>
+ #define THINGSBOARD_ENABLE_PROGMEM 0
+#elif defined(ESP32) || defined(RASPBERRYPI_PICO) || defined(RASPBERRYPI_PICO_W)
+ #include <WiFi.h>
+#endif
+#include <Arduino_MQTT_Client.h>
+#include <ThingsBoard.h>
+
+
+// ---------- LoRa config ----------
+#define LORA_FREQUENCY     868.1
+#define LORA_BANDWIDTH     125.0
+#define LORA_SPREADING     7
+#define LORA_CODING_RATE   5
+#define LORA_TX_POWER      10
+#define LORA_PREAMBLE_LEN  8
+#define LORA_SYNC_WORD     RADIOLIB_SX126X_SYNC_WORD_PRIVATE
+#define LORA_TCXO_VOLT     1.6
+#define LORA_USE_LDO       false
+
+
+#define LORA_NSS   41
+#define LORA_DIO1  39
+#define LORA_NRST  42
+#define LORA_BUSY  40
+
+
+SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY);
+
+
+// ---------- TB + Wi-Fi ----------
+constexpr char WIFI_SSID[]     = "TieLab";
+constexpr char WIFI_PASSWORD[] = "tielab2024";
+constexpr char TOKEN[]         = "vpYYynoU38oVyeugKvIs";   // e.g. device token from ThingsBoard
+constexpr char THINGSBOARD_SERVER[] = "demo.thingsboard.io";
+constexpr uint16_t THINGSBOARD_PORT = 1883;
+
+
+WiFiClient wifiClient;
+Arduino_MQTT_Client mqttClient(wifiClient);
+ThingsBoard tb(mqttClient);
+
+
+// ---------- JSON buffers ----------
+StaticJsonDocument<256> doc;     // for outbound commands (small)
+StaticJsonDocument<384> rxDoc;   // for inbound telemetry (a bit larger)
+char payload[256];
+
+
+// ---------- LoRa RX ISR flag ----------
+volatile bool rxFlag = false;
+IRAM_ATTR void onPacket() { rxFlag = true; }
+
+
+// ---------- Helpers ----------
+void connectWiFi() {
+ if (WiFi.status() == WL_CONNECTED) return;
+ WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+ while (WiFi.status() != WL_CONNECTED) { delay(300); }
+}
+
+
+void connectTB() {
+ if (tb.connected()) return;
+ if (WiFi.status() != WL_CONNECTED) connectWiFi();
+ // Try to connect
+ if (!tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT)) {
+   // If it fails, just return; loop() will retry on next telemetry
+ }
+}
+
+
+void sendTBTelemetry(float yawRate, float tempC, float speed, float rssi, float snr) {
+ connectTB();
+ if (!tb.connected()) return;
+ tb.sendTelemetryData("yawRate", yawRate);
+ tb.sendTelemetryData("temperature", tempC);
+ tb.sendTelemetryData("speed", speed);
+ // Optional radio metrics (may help debug link quality)
+ tb.sendTelemetryData("rssi", rssi);
+ tb.sendTelemetryData("snr",  snr);
+ tb.loop(); // process MQTT
+}
+
+
+void setup() {
+ Serial.begin(115200);
+ while (!Serial) {}
+ delay(500);
+
+
+ // Wi-Fi + TB (connect later on demand too)
+ connectWiFi();
+ connectTB();
+
+
+ // LoRa init
+ Serial.println(F("Initializing LoRa sender..."));
+ radio.setDio2AsRfSwitch(true);
+ int16_t state = radio.begin(
+   LORA_FREQUENCY, LORA_BANDWIDTH, LORA_SPREADING,
+   LORA_CODING_RATE, LORA_SYNC_WORD, LORA_TX_POWER,
+   LORA_PREAMBLE_LEN, LORA_TCXO_VOLT, LORA_USE_LDO
+ );
+ if (state != RADIOLIB_ERR_NONE) {
+   Serial.print(F("Radio init failed, code: "));
+   Serial.println(state);
+   while (true) { delay(1000); }
+ }
+ radio.setCRC(true);
+ radio.setPacketReceivedAction(onPacket);
+ radio.startReceive();
+
+
+ Serial.println(F("LoRa ready. Type w/s/a/d/x/o in Serial Monitor and press ENTER."));
+ Serial.println(F("Will forward received telemetry to ThingsBoard."));
+}
+
+
+void loop() {
+ // ===== 1) Keyboard -> LoRa command TX =====
+ if (Serial.available() > 0) {
+   String input = Serial.readStringUntil('\n');
+   input.trim();
+   if (input.length() > 0) {
+     doc.clear();
+     doc["id"]  = "node-01";
+     // allow 'ping' or 'w/s/a/d/x/o'
+     if (input.equalsIgnoreCase("ping")) {
+       doc["ack"] = "ping";
+     } else {
+       doc["cmd"] = input; // e.g., "w"
+     }
+
+
+     size_t n = serializeJson(doc, payload, sizeof(payload));
+     int16_t tx = radio.transmit(payload, n);
+
+
+     Serial.print(F("[TX] ")); Serial.write(payload, n);
+     Serial.print(F(" len=")); Serial.print(n);
+     Serial.print(F(" result=")); Serial.println(tx);
+
+
+     // Return to RX
+     radio.startReceive();
+   }
+ }
+
+
+ // ===== 2) LoRa RX -> TB telemetry =====
+ if (rxFlag) {
+   rxFlag = false;
+
+
+   String msg;
+   int16_t st = radio.readData(msg);   // fetch packet
+   float rssi = radio.getRSSI();
+   float snr  = radio.getSNR();
+
+
+   if (st == RADIOLIB_ERR_NONE) {
+     Serial.print(F("[RX] ")); Serial.println(msg);
+
+
+     rxDoc.clear();
+     DeserializationError err = deserializeJson(rxDoc, msg);
+     if (err) {
+       Serial.print(F("JSON parse error: "));
+       Serial.println(err.f_str());
+     } else {
+       // Expect {"id":"node-02","telemetry":{...}}
+       if (rxDoc.containsKey("telemetry")) {
+         JsonObject t = rxDoc["telemetry"];
+         float yawRate = t["yawRate"] | NAN;
+         float tempC   = t["tempC"]   | NAN;
+         float speed   = t["speed"]   | NAN;
+
+
+         // Forward to ThingsBoard
+         sendTBTelemetry(yawRate, tempC, speed, rssi, snr);
+       }
+       // Optional: handle "ack":"pong" from receiver if you want to log it
+     }
+
+
+     // Resume RX
+     radio.startReceive();
+   } else {
+     Serial.print(F("readData err: ")); Serial.println(st);
+     radio.startReceive();
+   }
+ }
+
+
+ // Keep TB MQTT alive
+ if (tb.connected()) tb.loop();
+
+
+ delay(1);
+}

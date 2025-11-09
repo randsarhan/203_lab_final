@@ -1,0 +1,387 @@
+#include <Arduino.h>
+#include <math.h>
+
+
+#define ENABLE_USB_TEST 0  // comment out or set 0 to disable
+
+
+const int DRIVE_PWM = 180; // The bassline PWM of the motors
+const int FWD_PWM   = +DRIVE_PWM;
+const int REV_PWM   = -DRIVE_PWM;
+const int TURN_PWM  =  DRIVE_PWM;
+
+
+const float MAX_CORR_SCALE = 0.50f;  // The maximum correction of the motors (in scale with max PWM)
+const int   YAW_SIGN       = +1;     // flip if correction feels inverted
+
+
+const bool INVERT_RIGHT_FWD = false;
+const bool INVERT_LEFT_FWD  = false;
+
+
+float YR_KP = 120.0f; // inner (yaw-rate) PID, responsiveness of correction (how quickly it corrects, too high and it might oscilate)
+float YR_KI = 0.0f;
+float YR_KD = 8.0f; // increasing will increasing damping, but too high might result in noisy corrections
+
+
+float HD_KP = 0.85f;      // outer (heading) PI
+float HD_KI = 0.12f;
+
+
+const float YAW_RATE_CMD_LIM = 0.35f;    // rad/s
+const float HEAD_INT_LIM     = 0.7f;     // rad
+
+
+// Motor A (Right)
+const int ENA = 25;
+const int IN1 = 26;
+const int IN2 = 27;
+// Motor B (Left)
+const int ENB = 13;
+const int IN3 = 33;
+const int IN4 = 14;
+
+
+// Relay
+const int RELAY_PIN = 32;
+
+
+// LoRa UART2
+HardwareSerial RXUART(2);
+const int RXD2_PIN = 16;
+const int TXD2_PIN = 17;
+const uint32_t RXUART_BAUD = 115200;
+
+
+// IMU UART1 (Feather TX -> ESP32 RX=GPIO2)
+HardwareSerial IMU_SERIAL(1);
+const int IMU_RX_PIN = 4;
+const int IMU_TX_PIN = -1; // not used since ESP is only receiving from IMU
+const uint32_t IMU_BAUD = 115200;
+
+
+// ========= STATE =========
+volatile char lastCmd = 'x';
+int basePWM = 0;
+
+
+static char imuLine[96];
+static uint8_t imuIdx = 0;
+static float yawRate_rad_s = 0.0f;
+static float temp_C = 0.0f;
+static float speed_mps = 0.0f;
+
+
+static uint32_t lastIMUms = 0;
+
+
+static float heading_cur = 0.0f;
+static float heading_des = 0.0f;
+static bool  headingCaptured = false;
+
+
+static float head_I = 0.0f;
+static float yaw_rate_cmd = 0.0f;
+
+
+static float yr_i = 0.0f, yr_prev_err = 0.0f;
+static uint32_t yr_prev_ms = 0;
+
+
+static float espYawBias = 0.0f;
+static bool  calibrating = false;
+static uint32_t calibStartMs = 0;
+static double calibSum = 0.0;
+static int    calibN = 0;
+
+
+const uint32_t TELEMETRY_MS = 800;
+uint32_t lastTlm = 0;
+
+
+// ========= UTILS =========
+static inline int clampPWM(int v){ return v>255?255:(v<-255?-255:v); }
+static inline float constrainf_(float x,float a,float b){ return x<a?a:(x>b?b:x); }
+static inline float wrap_pi(float a){ while(a>M_PI)a-=2*M_PI; while(a<-M_PI)a+=2*M_PI; return a; }
+
+
+// ========= MOTORS =========
+void motorSetup(){
+ pinMode(ENA,OUTPUT); pinMode(ENB,OUTPUT);
+ pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
+ pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+ pinMode(RELAY_PIN,OUTPUT);
+ digitalWrite(RELAY_PIN,LOW);
+ analogWrite(ENA,0); analogWrite(ENB,0);
+}
+
+
+void setMotorRight(int pwm){
+ bool fwd = pwm >= 0;
+ if (INVERT_RIGHT_FWD) fwd = !fwd;
+ int duty = abs(pwm); if (duty>255) duty=255;
+ digitalWrite(IN1, fwd ? HIGH : LOW);
+ digitalWrite(IN2, fwd ? LOW  : HIGH);
+ analogWrite(ENA, duty);
+}
+
+
+void setMotorLeft(int pwm){
+ bool fwd = pwm >= 0;
+ if (INVERT_LEFT_FWD) fwd = !fwd;
+ int duty = abs(pwm); if (duty>255) duty=255;
+ digitalWrite(IN3, fwd ? HIGH : LOW);
+ digitalWrite(IN4, fwd ? LOW  : HIGH);
+ analogWrite(ENB, duty);
+}
+
+
+void motorStopAll(){ analogWrite(ENA,0); analogWrite(ENB,0); }
+
+
+// Combine base throttle and correction
+void driveWithYawHold(int base, int corr){
+ int left  = clampPWM(base + corr);
+ int right = clampPWM(base - corr);
+ setMotorLeft(left);
+ setMotorRight(right);
+}
+
+
+// ========= IMU =========
+bool readIMULine(float &yr, float &tc, float &sp){
+ while (IMU_SERIAL.available()){
+   char c = (char)IMU_SERIAL.read();
+   if (c=='\r') continue;
+   if (c=='\n'){
+     imuLine[imuIdx] = '\0';
+     imuIdx = 0;
+
+
+     // parse: "<yr> , <tc> , <sp>"
+     char* p = imuLine;
+     char* endp;
+     yr = strtof(p, &endp);
+     if (endp == p) return false;
+     p = endp; while (*p && (*p==',' || *p==' ')) ++p;
+
+
+     tc = strtof(p, &endp);
+     if (endp == p) return false;
+     p = endp; while (*p && (*p==',' || *p==' ')) ++p;
+
+
+     sp = strtof(p, &endp);
+     if (endp == p) return false;
+
+
+     return true;
+   }
+   if (imuIdx < sizeof(imuLine)-1) imuLine[imuIdx++] = c; else imuIdx = 0;
+ }
+ return false;
+}
+
+
+void integrateHeading(float yawRateSigned){
+ uint32_t now = millis();
+ if (!lastIMUms) lastIMUms = now;
+ float dt = (now - lastIMUms)/1000.0f;
+ if (dt < 0.0005f) dt = 0.0005f;
+ if (dt > 0.0500f) dt = 0.0500f;
+ lastIMUms = now;
+ heading_cur += yawRateSigned * dt;
+ heading_cur = wrap_pi(heading_cur);
+}
+
+
+// ========= CONTROLLERS =========
+void headingOuterLoop(float dt_outer){
+ float err = wrap_pi(heading_des - heading_cur);
+ head_I += err * dt_outer;
+ head_I = constrainf_(head_I, -HEAD_INT_LIM, HEAD_INT_LIM);
+ float cmd = HD_KP * err + HD_KI * head_I;
+ yaw_rate_cmd = constrainf_(cmd, -YAW_RATE_CMD_LIM, YAW_RATE_CMD_LIM);
+}
+
+
+int yawRateInnerLoop(float yawRate_meas){
+ float err = yaw_rate_cmd - yawRate_meas;
+ uint32_t now = millis();
+ if (!yr_prev_ms) yr_prev_ms = now;
+ float dt = (now - yr_prev_ms)/1000.0f;
+ if (dt < 0.001f) dt = 0.001f;
+ yr_i += err * dt;
+ yr_i = constrainf_(yr_i, -0.8f, 0.8f);
+ float d = (err - yr_prev_err)/dt;
+ float u = YR_KP*err + YR_KI*yr_i + YR_KD*d;
+ yr_prev_err = err; yr_prev_ms = now;
+ if (fabsf(u) < 1.0f) u = 0.0f;
+ float max_corr = FWD_PWM * MAX_CORR_SCALE;
+ if (u >  max_corr) u =  max_corr;
+ if (u < -max_corr) u = -max_corr;
+ return (int)u;
+}
+
+
+// ========= COMMAND HANDLER =========
+void handleCommandChar(char cRaw){
+ char c = tolower(cRaw);
+ lastCmd = c;
+
+
+ switch (c){
+   case 'w': { // forward (with correction)
+     basePWM = FWD_PWM;
+     heading_des = heading_cur;
+     headingCaptured = true;
+     head_I = 0.0f;
+     yaw_rate_cmd = 0.0f;
+   } break;
+
+
+   case 's': { // reverse (no correction)
+     basePWM = REV_PWM;
+     headingCaptured = false;
+     setMotorLeft(basePWM);
+     setMotorRight(basePWM);
+   } break;
+
+
+   case 'a': { // turn left full speed
+     basePWM = 0;
+     headingCaptured = false;
+     setMotorLeft(0);
+     setMotorRight(+TURN_PWM);
+   } break;
+
+
+   case 'd': { // turn right full speed
+     basePWM = 0;
+     headingCaptured = false;
+     setMotorLeft(+TURN_PWM);
+     setMotorRight(0);
+   } break;
+
+
+   case 'o': { // open relay
+     digitalWrite(RELAY_PIN, HIGH);
+   } break;
+
+
+   case 'x':
+   default: { // stop
+     basePWM = 0;
+     headingCaptured = false;
+     motorStopAll();
+     digitalWrite(RELAY_PIN, LOW);
+   } break;
+
+
+   case 'c': { // calibration
+     calibrating   = true;
+     calibStartMs  = millis();
+     calibSum = 0.0; calibN = 0;
+     basePWM = 0; motorStopAll();
+     headingCaptured = false;
+   } break;
+ }
+}
+
+
+void pollRXUART(){
+ while (RXUART.available()){
+   char c = (char)RXUART.read();
+   if (c=='\r' || c=='\n') continue;
+   handleCommandChar(c);
+ }
+}
+
+
+// ========= USB TEST MODE =========
+#if ENABLE_USB_TEST
+void usbPrintTelemetryEvery(uint32_t interval_ms = 500) {
+ static uint32_t last = 0;
+ uint32_t now = millis();
+ if (now - last < interval_ms) return;
+ last = now;
+ Serial.print("CMD="); Serial.print(lastCmd);
+ Serial.print(" | yawRate(rad/s)="); Serial.print(yawRate_rad_s, 4);
+ Serial.print(" | temp="); Serial.print(temp_C, 2);
+ Serial.print(" | speed="); Serial.print(speed_mps, 2);
+ Serial.print(" | heading="); Serial.println(heading_cur, 3);
+}
+
+
+void usbConsoleTask() {
+ while (Serial.available()) {
+   char c = Serial.read();
+   if (c=='\r'||c=='\n') continue;
+   handleCommandChar(c);
+ }
+}
+#endif
+
+
+// ========= ARDUINO =========
+void setup(){
+ IMU_SERIAL.begin(IMU_BAUD, SERIAL_8N1, IMU_RX_PIN, IMU_TX_PIN);
+ RXUART.begin(RXUART_BAUD, SERIAL_8N1, RXD2_PIN, TXD2_PIN);
+ motorSetup();
+ motorStopAll();
+#if ENABLE_USB_TEST
+ Serial.begin(115200);
+ delay(200);
+ Serial.println("USB TEST MODE ACTIVE");
+ Serial.println("Type: w/s/a/d/o/x  (c=calibrate)");
+#endif
+}
+
+
+void loop(){
+ pollRXUART();
+
+
+ float yr, tc, sp;
+ if (readIMULine(yr, tc, sp)){
+   if (calibrating){
+     calibSum += yr; calibN++;
+     if (millis() - calibStartMs >= 2000){
+       espYawBias  = (calibN > 0) ? (float)(calibSum / calibN) : 0.0f;
+       calibrating = false;
+       heading_cur = 0.0f; heading_des = 0.0f; head_I = 0.0f;
+     }
+   }
+   yawRate_rad_s = YAW_SIGN * (yr - espYawBias);
+   temp_C        = tc;
+   speed_mps     = sp;
+   integrateHeading(yawRate_rad_s);
+ }
+
+
+ if (lastCmd == 'w') {
+   headingOuterLoop(0.010f);
+   int corr = yawRateInnerLoop(yawRate_rad_s);
+   driveWithYawHold(basePWM, corr);   // correction only in forward
+ }
+ else if (lastCmd == 's' || lastCmd == 'a' || lastCmd == 'd') {
+   // manual direct drive
+ }
+ else motorStopAll();
+
+
+ uint32_t now = millis();
+ if (now - lastTlm >= TELEMETRY_MS){
+   lastTlm = now;
+   RXUART.printf("%.5f,%.2f,%.3f\n", yawRate_rad_s, temp_C, speed_mps);
+ }
+
+
+#if ENABLE_USB_TEST
+ usbConsoleTask();
+ usbPrintTelemetryEvery(500);
+#endif
+
+
+ delay(10);
+}

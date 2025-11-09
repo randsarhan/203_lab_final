@@ -1,0 +1,324 @@
+#include <Arduino.h>
+#include <RadioLib.h>
+#include <ArduinoJson.h>
+
+
+#define LORA_FREQUENCY     868.1
+#define LORA_BANDWIDTH     125.0
+#define LORA_SPREADING     7
+#define LORA_CODING_RATE   5
+#define LORA_TX_POWER      10
+#define LORA_PREAMBLE_LEN  8
+#define LORA_SYNC_WORD     RADIOLIB_SX126X_SYNC_WORD_PRIVATE
+#define LORA_TCXO_VOLT     1.6
+#define LORA_USE_LDO       false
+
+
+#define LORA_NSS   41
+#define LORA_DIO1  39
+#define LORA_NRST  42
+#define LORA_BUSY  40
+
+
+SX1262 radio = new Module(LORA_NSS, LORA_DIO1, LORA_NRST, LORA_BUSY);
+
+
+// ----------------- TELEMETRY THROTTLING (TUNE THESE) -----------------
+static const uint32_t TELEMETRY_MIN_INTERVAL_MS = 600;  // min gap between uplinks (e.g., 500–1000 ms)
+static const uint32_t JITTER_MS                 = 120;  // add 0..JITTER_MS random to spread packets
+static const uint32_t RX_GUARD_MS               = 350;  // pause after ANY RX before we TX telemetry
+static const uint32_t FORCE_SEND_MS             = 4000; // send at least once this often even if no change
+
+
+// Only uplink if values changed more than these thresholds
+static const float YAWRATE_DEADBAND = 0.002f;   // rad/s (~0.11 deg/s)
+static const float TEMP_DEADBAND    = 0.08f;    // °C
+static const float SPEED_DEADBAND   = 0.02f;    // m/s
+// ---------------------------------------------------------------------
+
+
+// Small doc for RX parsing; we build a separate JSON for TX telemetry
+constexpr size_t DOC_CAPACITY = JSON_OBJECT_SIZE(8);
+StaticJsonDocument<DOC_CAPACITY> doc;
+
+
+volatile bool rxFlag = false;
+IRAM_ATTR void onPacket() { rxFlag = true; }
+
+
+// ===== UART link to motor ESP32 =====
+HardwareSerial MotorUART(2);              // Serial2
+const int TXD2_PIN = 43;                  // to ESP32 RX (for commands)
+const int RXD2_PIN = 44;                  // from ESP32 TX (for telemetry)
+const unsigned long UART_BAUD = 115200;
+
+
+// Rate-limit / guard bookkeeping
+uint32_t lastTlmMs         = 0;           // last time we *sent* telemetry
+uint32_t lastDownlinkMs    = 0;           // last time we *received* LoRa packet
+uint32_t jitterThisBurstMs = 0;           // randomized spacing per burst
+uint32_t lastForceSendMs   = 0;           // last "forced" telemetry time
+
+
+// For change-detection (deadbands)
+bool     havePrev = false;
+float    prevYaw = 0.0f, prevTemp = 0.0f, prevSpeed = 0.0f;
+
+
+// Buffer for UART CSV from ESP32
+String espBuf;
+
+
+// Forward decl
+void handleHandshake();
+void handleCommand(const char* cmdStr);
+void tryReadEsp32TelemetryAndUplink();
+
+
+// Helpers
+static inline bool changedEnough(float a, float b, float thr) {
+ return fabsf(a - b) > thr;
+}
+
+
+static inline bool okToSendNow(uint32_t now) {
+ // honor guard after downlink, and spacing + jitter since last TX
+ if (now - lastDownlinkMs < RX_GUARD_MS) return false;
+ if (now - lastTlmMs < TELEMETRY_MIN_INTERVAL_MS + jitterThisBurstMs) return false;
+ return true;
+}
+
+
+void setup() {
+ Serial.begin(115200);
+  delay(300);
+
+
+ // UART to motor ESP32
+ MotorUART.begin(UART_BAUD, SERIAL_8N1, RXD2_PIN, TXD2_PIN);
+
+
+ Serial.println(F("Receiver initializing..."));
+ radio.setDio2AsRfSwitch(true);
+
+
+ int16_t state = radio.begin(
+   LORA_FREQUENCY, LORA_BANDWIDTH, LORA_SPREADING,
+   LORA_CODING_RATE, LORA_SYNC_WORD, LORA_TX_POWER,
+   LORA_PREAMBLE_LEN, LORA_TCXO_VOLT, LORA_USE_LDO
+ );
+ if (state != RADIOLIB_ERR_NONE) {
+   Serial.print(F("Radio init failed: "));
+   Serial.println(state);
+   while (true) delay(1000);
+ }
+
+
+ radio.setCRC(true);
+ radio.setPacketReceivedAction(onPacket);
+ radio.startReceive();
+
+
+ // Seed jitter
+ randomSeed((uint32_t)esp_random());
+ jitterThisBurstMs = random(0, JITTER_MS);
+
+
+ Serial.println(F("Receiver ready (JSON cmds + throttled UART telemetry → LoRa uplink)"));
+}
+
+
+void handleHandshake() {
+ // Build and send {"id":"node-02","ack":"pong","ok":1}
+ StaticJsonDocument<128> txDoc;
+ txDoc["id"]  = "node-02";
+ txDoc["ack"] = "pong";
+ txDoc["ok"]  = 1;
+
+
+ char buffer[128];
+ size_t n = serializeJson(txDoc, buffer, sizeof(buffer));
+
+
+ Serial.print(F("[TX ACK] ")); Serial.write(buffer, n); Serial.println();
+ int16_t tx = radio.transmit(buffer, n);
+ Serial.print(F("Transmit result: ")); Serial.println(tx);
+
+
+ // Back to RX
+ radio.startReceive();
+}
+
+
+void handleCommand(const char* cmdStr) {
+ // Expect "w","s","a","d","x","o" (case-insensitive accepted)
+ if (!cmdStr || !cmdStr[0]) return;
+ char c = tolower(cmdStr[0]);
+
+
+ switch (c) {
+   case 'w': Serial.println(F("[CMD] forward (w)"));   break;
+   case 's': Serial.println(F("[CMD] backward (s)"));  break;
+   case 'a': Serial.println(F("[CMD] left (a)"));      break;
+   case 'd': Serial.println(F("[CMD] right (d)"));     break;
+   case 'x': Serial.println(F("[CMD] stop (x)"));      break;
+   case 'o': Serial.println(F("[CMD] open relay (o)"));break;
+   default:
+     Serial.print(F("[CMD] unknown: ")); Serial.println(cmdStr); break;
+ }
+
+
+ // Forward the single-character command to the motor ESP32
+ MotorUART.println(c);
+ Serial.print(F("[UART→ESP32] Sent: ")); Serial.println(c);
+
+
+ // NOTE: we could ACK commands here if desired; keeping it simple.
+}
+
+
+// Try to read a full line "yawRate,temp,speed" from ESP32 and uplink via LoRa
+void tryReadEsp32TelemetryAndUplink() {
+ // Accumulate until newline
+ while (MotorUART.available()) {
+   char ch = MotorUART.read();
+   if (ch == '\r') continue;
+   if (ch == '\n') {
+     // parse line
+     if (espBuf.length() > 0) {
+       float yawRate = NAN, tempC = NAN, speed = NAN;
+       if (sscanf(espBuf.c_str(), " %f , %f , %f", &yawRate, &tempC, &speed) == 3) {
+
+
+         uint32_t now = millis();
+
+
+         // Only send if (a) enough time passed + jitter, AND (b) values changed enough
+         bool time_ok   = okToSendNow(now);
+         bool force_ok  = (now - lastForceSendMs >= FORCE_SEND_MS);  // periodic keepalive
+         bool changed   = !havePrev ||
+                          changedEnough(yawRate, prevYaw,  YAWRATE_DEADBAND) ||
+                          changedEnough(tempC,   prevTemp, TEMP_DEADBAND)    ||
+                          changedEnough(speed,   prevSpeed, SPEED_DEADBAND);
+
+
+         if ((time_ok && changed) || force_ok) {
+           lastTlmMs       = now;
+           lastForceSendMs = force_ok ? now : lastForceSendMs;
+
+
+           // refresh jitter each time we do send
+           jitterThisBurstMs = random(0, JITTER_MS);
+
+
+           // Remember last sent values
+           havePrev = true;
+           prevYaw   = yawRate;
+           prevTemp  = tempC;
+           prevSpeed = speed;
+
+
+           // Build telemetry JSON:
+           // {"id":"node-02","telemetry":{"yawRate":..., "tempC":..., "speed":...}}
+           StaticJsonDocument<160> tdoc;
+           tdoc["id"] = "node-02";
+           JsonObject t = tdoc.createNestedObject("telemetry");
+           t["yawRate"] = yawRate;
+           t["tempC"]   = tempC;
+           t["speed"]   = speed;
+
+
+           char out[180];
+           size_t n = serializeJson(tdoc, out, sizeof(out));
+
+
+           // Send over LoRa (briefly leaves RX mode)
+           int16_t tx = radio.transmit(out, n);
+           Serial.print(F("[TX telem] ")); Serial.write(out, n);
+           Serial.print(F("  -> ")); Serial.println(tx);
+
+
+           // Back to receive
+           radio.startReceive();
+         }
+       } else {
+         Serial.print(F("[UART RX] Bad CSV: ")); Serial.println(espBuf);
+       }
+       espBuf = "";
+     }
+   } else {
+     espBuf += ch;
+     if (espBuf.length() > 128) espBuf = ""; // guard against runaway
+   }
+ }
+}
+
+
+void loop() {
+ // 1) LoRa downlink handling (commands/handshake)
+ if (rxFlag) {
+   rxFlag = false;
+
+
+   String msg;
+   int16_t st = radio.readData(msg);
+   if (st == RADIOLIB_ERR_NONE) {
+     // mark last downlink time (to enforce RX guard)
+     lastDownlinkMs = millis();
+
+
+     float rssi = radio.getRSSI();
+     float snr  = radio.getSNR();
+
+
+     String trimmed = msg; trimmed.trim();
+     if (trimmed.length() == 0) {
+       // ignore empty frames
+     } else {
+       doc.clear();
+       DeserializationError err = deserializeJson(doc, trimmed);
+       if (err) {
+         Serial.print(F("[RX] JSON parse error: ")); Serial.println(err.f_str());
+         Serial.print(F("Raw: ")); Serial.println(trimmed);
+       } else {
+         const char* id  = doc["id"];
+         Serial.print(F("[RX] id=")); Serial.print(id ? id : "<none>");
+         Serial.print(F("  RSSI=")); Serial.print(rssi, 1);
+         Serial.print(F(" dBm  SNR=")); Serial.print(snr, 1);
+         Serial.println(F(" dB"));
+
+
+         // {"ack":"ping"} → reply
+         if (doc.containsKey("ack")) {
+           const char* ack = doc["ack"];
+           if (ack && strcmp(ack, "ping") == 0) {
+             Serial.println(F("[HS] ping → pong"));
+             handleHandshake();
+           }
+         }
+
+
+         // {"cmd":"w/s/a/d/x/o"} → forward to ESP32
+         if (doc.containsKey("cmd")) {
+           const char* cmd = doc["cmd"];
+           handleCommand(cmd);
+         }
+       }
+     }
+
+
+     // Always resume RX
+     radio.startReceive();
+   } else {
+     Serial.print(F("readData err: ")); Serial.println(st);
+     radio.startReceive();
+   }
+ }
+
+
+ // 2) Read ESP32 telemetry and uplink (throttled + deadband + guard)
+ tryReadEsp32TelemetryAndUplink();
+
+
+ delay(1);
+}
